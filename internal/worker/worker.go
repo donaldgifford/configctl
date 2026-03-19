@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,9 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
-	"github.com/donaldgifford/configctl/internal/config"
-	"github.com/donaldgifford/configctl/internal/report"
+	"github.com/configctl/internal/config"
+	"github.com/configctl/internal/report"
 )
+
+const serviceLinkedPrefix = "AWSConfigurationRecorderFor"
 
 type Pool struct {
 	cfg       *config.Config
@@ -110,116 +113,147 @@ func (p *Pool) process(ctx context.Context, item config.WorkItem) {
 		errMsg := err.Error()
 		logger.Error("failed to assume role", "error", err)
 		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			CurrentStatus: "error",
-			Error:         &errMsg,
+			Region: item.Region,
+			Error:  &errMsg,
 		})
 		return
 	}
 
 	cfgClient := configservice.NewFromConfig(regionalCfg)
 
-	// Describe existing recorders.
-	recorders, err := cfgClient.DescribeConfigurationRecorders(
-		ctx,
-		&configservice.DescribeConfigurationRecordersInput{},
-	)
+	// Describe ALL recorders (customer-managed + service-linked).
+	recorders, err := cfgClient.DescribeConfigurationRecorders(ctx, &configservice.DescribeConfigurationRecordersInput{})
 	if err != nil {
 		errMsg := fmt.Sprintf("describing recorders: %v", err)
 		logger.Error("failed to describe recorders", "error", err)
 		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			CurrentStatus: "error",
-			Error:         &errMsg,
+			Region: item.Region,
+			Error:  &errMsg,
 		})
 		return
 	}
 
-	if len(recorders.ConfigurationRecorders) == 0 {
-		logger.Info("no recorder found")
-		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			CurrentStatus: "absent",
+	// Get status for all recorders.
+	var allNames []string
+	for _, rec := range recorders.ConfigurationRecorders {
+		allNames = append(allNames, aws.ToString(rec.Name))
+	}
+
+	statusMap := make(map[string]bool) // name -> recording
+	if len(allNames) > 0 {
+		statusOut, err := cfgClient.DescribeConfigurationRecorderStatus(ctx, &configservice.DescribeConfigurationRecorderStatusInput{
+			ConfigurationRecorderNames: allNames,
 		})
-		return
-	}
-
-	recorderName := aws.ToString(recorders.ConfigurationRecorders[0].Name)
-
-	// Check recorder status.
-	statusOut, err := cfgClient.DescribeConfigurationRecorderStatus(
-		ctx,
-		&configservice.DescribeConfigurationRecorderStatusInput{
-			ConfigurationRecorderNames: []string{recorderName},
-		},
-	)
-	if err != nil {
-		errMsg := fmt.Sprintf("describing recorder status: %v", err)
-		logger.Error("failed to describe recorder status", "error", err)
-		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			RecorderName:  recorderName,
-			CurrentStatus: "error",
-			Error:         &errMsg,
-		})
-		return
-	}
-
-	wasRecording := false
-	if len(statusOut.ConfigurationRecordersStatus) > 0 {
-		wasRecording = statusOut.ConfigurationRecordersStatus[0].Recording
-	}
-
-	if p.dryRun {
-		status := "disabled"
-		if wasRecording {
-			status = "enabled"
+		if err != nil {
+			// Non-fatal: we can still report recorders exist, just without status.
+			logger.Warn("failed to describe recorder statuses", "error", err)
+		} else {
+			for _, s := range statusOut.ConfigurationRecordersStatus {
+				statusMap[aws.ToString(s.Name)] = s.Recording
+			}
 		}
-		logger.Info("dry-run: checked recorder", "recorder", recorderName, "recording", wasRecording)
-		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			RecorderName:  recorderName,
-			WasEnabled:    wasRecording,
-			CurrentStatus: status,
-		})
-		return
 	}
 
-	// Live run: stop the recorder if it's recording.
-	if !wasRecording {
-		logger.Info("recorder already stopped", "recorder", recorderName)
-		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			RecorderName:  recorderName,
+	// Classify recorders.
+	regionReport := report.RegionReport{
+		Region: item.Region,
+	}
+
+	for _, rec := range recorders.ConfigurationRecorders {
+		name := aws.ToString(rec.Name)
+		recording := statusMap[name]
+
+		if isServiceLinked(name) {
+			// Service-linked recorder — report only, never stop.
+			slr := report.RecorderReport{
+				Name:          name,
+				WasEnabled:    recording,
+				CurrentStatus: boolToStatus(recording),
+			}
+
+			// Extract service principal if available.
+			if rec.ServicePrincipal != nil {
+				slr.ServicePrincipal = aws.ToString(rec.ServicePrincipal)
+			}
+
+			// Extract recording scope if available.
+			if rec.RecordingScope != "" {
+				slr.RecordingScope = string(rec.RecordingScope)
+			}
+
+			logger.Info("found service-linked recorder",
+				"recorder", name,
+				"recording", recording,
+				"servicePrincipal", slr.ServicePrincipal,
+				"recordingScope", slr.RecordingScope,
+			)
+
+			regionReport.ServiceLinkedRecorders = append(regionReport.ServiceLinkedRecorders, slr)
+			continue
+		}
+
+		// Customer-managed recorder.
+		cr := p.handleCustomerRecorder(ctx, logger, cfgClient, name, recording)
+		regionReport.CustomerRecorder = &cr
+	}
+
+	// If no customer-managed recorder was found, mark absent.
+	if regionReport.CustomerRecorder == nil {
+		logger.Info("no customer-managed recorder found")
+		regionReport.CustomerRecorder = nil // explicit nil for absent
+	}
+
+	p.collector.Add(item.AccountID, regionReport)
+}
+
+// handleCustomerRecorder processes the customer-managed "default" recorder.
+// In dry-run it reports state; in live mode it stops the recorder if active.
+func (p *Pool) handleCustomerRecorder(
+	ctx context.Context,
+	logger *slog.Logger,
+	client *configservice.Client,
+	name string,
+	recording bool,
+) report.RecorderReport {
+	if p.dryRun {
+		logger.Info("dry-run: checked customer recorder", "recorder", name, "recording", recording)
+		return report.RecorderReport{
+			Name:          name,
+			WasEnabled:    recording,
+			CurrentStatus: boolToStatus(recording),
+		}
+	}
+
+	// Live run.
+	if !recording {
+		logger.Info("customer recorder already stopped", "recorder", name)
+		return report.RecorderReport{
+			Name:          name,
 			WasEnabled:    false,
 			CurrentStatus: "disabled",
-		})
-		return
+		}
 	}
 
-	_, err = cfgClient.StopConfigurationRecorder(ctx, &configservice.StopConfigurationRecorderInput{
-		ConfigurationRecorderName: aws.String(recorderName),
+	_, err := client.StopConfigurationRecorder(ctx, &configservice.StopConfigurationRecorderInput{
+		ConfigurationRecorderName: aws.String(name),
 	})
 	if err != nil {
 		errMsg := fmt.Sprintf("stopping recorder: %v", err)
-		logger.Error("failed to stop recorder", "error", err)
-		p.collector.Add(item.AccountID, report.RegionReport{
-			Region:        item.Region,
-			RecorderName:  recorderName,
+		logger.Error("failed to stop customer recorder", "recorder", name, "error", err)
+		return report.RecorderReport{
+			Name:          name,
 			WasEnabled:    true,
 			CurrentStatus: "error",
 			Error:         &errMsg,
-		})
-		return
+		}
 	}
 
-	logger.Info("stopped recorder", "recorder", recorderName)
-	p.collector.Add(item.AccountID, report.RegionReport{
-		Region:        item.Region,
-		RecorderName:  recorderName,
+	logger.Info("stopped customer recorder", "recorder", name)
+	return report.RecorderReport{
+		Name:          name,
 		WasEnabled:    true,
 		CurrentStatus: "stopped",
-	})
+	}
 }
 
 func (p *Pool) assumeRegionalConfig(ctx context.Context, item config.WorkItem) (aws.Config, error) {
@@ -247,4 +281,16 @@ func (p *Pool) assumeRegionalConfig(ctx context.Context, item config.WorkItem) (
 	}
 
 	return regionalCfg, nil
+}
+
+// isServiceLinked returns true if the recorder name indicates a service-linked recorder.
+func isServiceLinked(name string) bool {
+	return strings.HasPrefix(name, serviceLinkedPrefix)
+}
+
+func boolToStatus(recording bool) string {
+	if recording {
+		return "enabled"
+	}
+	return "disabled"
 }

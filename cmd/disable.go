@@ -8,9 +8,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/donaldgifford/configctl/internal/config"
-	"github.com/donaldgifford/configctl/internal/report"
-	"github.com/donaldgifford/configctl/internal/worker"
+	"github.com/configctl/internal/config"
+	"github.com/configctl/internal/report"
+	"github.com/configctl/internal/worker"
 )
 
 var (
@@ -39,8 +39,7 @@ func init() {
 	disableCmd.Flags().StringVarP(&configFile, "config", "c", "config.yaml", "path to YAML configuration file")
 	disableCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "check recorder status without making changes")
 	disableCmd.Flags().StringVarP(&outputFile, "output", "o", "report.json", "path to write JSON report")
-	disableCmd.Flags().
-		StringVarP(&awsProfile, "aws-profile", "p", "", "AWS CLI profile (overrides config file awsProfile)")
+	disableCmd.Flags().StringVarP(&awsProfile, "aws-profile", "p", "", "AWS CLI profile (overrides config file awsProfile)")
 
 	rootCmd.AddCommand(disableCmd)
 }
@@ -105,11 +104,20 @@ func runDisable(cmd *cobra.Command, args []string) error {
 
 	// Print summary to stderr.
 	logger.Info("run complete",
-		"recordersEnabled", result.Summary.RecordersEnabled,
-		"recordersDisabled", result.Summary.RecordersDisabled,
-		"recordersAbsent", result.Summary.RecordersAbsent,
+		"customerRecordersEnabled", result.Summary.CustomerRecordersEnabled,
+		"customerRecordersDisabled", result.Summary.CustomerRecordersDisabled,
+		"customerRecordersAbsent", result.Summary.CustomerRecordersAbsent,
+		"serviceLinkedRecorders", result.Summary.ServiceLinkedRecorders,
+		"serviceLinkedRecordersPaid", result.Summary.ServiceLinkedRecordersPaid,
 		"errors", result.Summary.Errors,
 	)
+
+	if result.Summary.ServiceLinkedRecorders > 0 {
+		logger.Warn("service-linked recorders detected — these cannot be stopped via Config API, disable them through the owning AWS service",
+			"total", result.Summary.ServiceLinkedRecorders,
+			"paid", result.Summary.ServiceLinkedRecordersPaid,
+		)
+	}
 
 	// Write report.
 	if err := report.WriteJSON(result, outputFile); err != nil {

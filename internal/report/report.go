@@ -16,32 +16,42 @@ type Report struct {
 }
 
 type Summary struct {
-	TotalAccounts    int `json:"totalAccounts"`
-	TotalRegions     int `json:"totalRegions"`
-	RecordersEnabled int `json:"recordersEnabled"`
-	RecordersDisabled int `json:"recordersDisabled"`
-	RecordersAbsent  int `json:"recordersAbsent"`
-	Errors           int `json:"errors"`
+	TotalAccounts              int `json:"totalAccounts"`
+	TotalRegions               int `json:"totalRegions"`
+	CustomerRecordersEnabled   int `json:"customerRecordersEnabled"`
+	CustomerRecordersDisabled  int `json:"customerRecordersDisabled"`
+	CustomerRecordersAbsent    int `json:"customerRecordersAbsent"`
+	ServiceLinkedRecorders     int `json:"serviceLinkedRecorders"`
+	ServiceLinkedRecordersPaid int `json:"serviceLinkedRecordersPaid"`
+	Errors                     int `json:"errors"`
 }
 
 type AccountReport struct {
-	AccountID       string         `json:"accountId"`
-	IsManagementAcct bool          `json:"isManagementAccount"`
-	Regions         []RegionReport `json:"regions"`
+	AccountID        string         `json:"accountId"`
+	IsManagementAcct bool           `json:"isManagementAccount"`
+	Regions          []RegionReport `json:"regions"`
 }
 
 type RegionReport struct {
-	Region        string  `json:"region"`
-	RecorderName  string  `json:"recorderName,omitempty"`
-	WasEnabled    bool    `json:"wasEnabled"`
-	CurrentStatus string  `json:"currentStatus"`
-	Error         *string `json:"error"`
+	Region                 string           `json:"region"`
+	CustomerRecorder       *RecorderReport  `json:"customerRecorder"`
+	ServiceLinkedRecorders []RecorderReport `json:"serviceLinkedRecorders,omitempty"`
+	Error                  *string          `json:"error,omitempty"`
+}
+
+type RecorderReport struct {
+	Name             string  `json:"name"`
+	WasEnabled       bool    `json:"wasEnabled"`
+	CurrentStatus    string  `json:"currentStatus"`
+	RecordingScope   string  `json:"recordingScope,omitempty"`   // "INTERNAL" (free) or "PAID" — service-linked only
+	ServicePrincipal string  `json:"servicePrincipal,omitempty"` // e.g. "cloudwatch.amazonaws.com" — service-linked only
+	Error            *string `json:"error,omitempty"`
 }
 
 // Collector is a thread-safe accumulator for region results.
 type Collector struct {
-	mu      sync.Mutex
-	results map[string][]RegionReport // accountID -> regions
+	mu       sync.Mutex
+	results  map[string][]RegionReport // accountID -> regions
 	mgmtAcct string
 }
 
@@ -86,26 +96,42 @@ func (c *Collector) Build(dryRun bool, accountIDs []string) *Report {
 
 		regions := c.results[acctID]
 		acctReport := AccountReport{
-			AccountID:       acctID,
+			AccountID:        acctID,
 			IsManagementAcct: acctID == c.mgmtAcct,
-			Regions:         regions,
+			Regions:          regions,
 		}
 
 		for _, reg := range regions {
 			uniqueRegions[reg.Region] = struct{}{}
 
+			// Top-level error (e.g. assume role failure).
 			if reg.Error != nil {
 				r.Summary.Errors++
 				continue
 			}
 
-			switch reg.CurrentStatus {
-			case "enabled":
-				r.Summary.RecordersEnabled++
-			case "disabled", "stopped":
-				r.Summary.RecordersDisabled++
-			case "absent":
-				r.Summary.RecordersAbsent++
+			// Customer-managed recorder.
+			if reg.CustomerRecorder == nil {
+				r.Summary.CustomerRecordersAbsent++
+			} else {
+				if reg.CustomerRecorder.Error != nil {
+					r.Summary.Errors++
+				} else {
+					switch reg.CustomerRecorder.CurrentStatus {
+					case "enabled":
+						r.Summary.CustomerRecordersEnabled++
+					case "disabled", "stopped":
+						r.Summary.CustomerRecordersDisabled++
+					}
+				}
+			}
+
+			// Service-linked recorders.
+			for _, slr := range reg.ServiceLinkedRecorders {
+				r.Summary.ServiceLinkedRecorders++
+				if slr.RecordingScope == "PAID" {
+					r.Summary.ServiceLinkedRecordersPaid++
+				}
 			}
 		}
 

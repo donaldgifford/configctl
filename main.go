@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/donaldgifford/configctl/cmd"
+	"github.com/configctl/cmd"
 )
 
 func main() {

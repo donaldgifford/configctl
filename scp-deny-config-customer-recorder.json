@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyCustomerConfigRecorderReEnablement",
+      "Effect": "Deny",
+      "Action": [
+        "config:StartConfigurationRecorder",
+        "config:PutConfigurationRecorder",
+        "config:PutDeliveryChannel",
+        "config:DeleteConfigurationRecorder"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalARN": [
+            "arn:aws:iam::*:role/BreakGlassRole"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyServiceLinkedConfigRecorder",
+      "Effect": "Deny",
+      "Action": [
+        "config:PutServiceLinkedConfigurationRecorder"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalARN": [
+            "arn:aws:iam::*:role/BreakGlassRole"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -42,15 +42,15 @@ concurrency:
   retryMaxBackoff: 30s
 ```
 
-| Field                          | Description                                                    |
-| ------------------------------ | -------------------------------------------------------------- |
-| `accounts`                     | List of target AWS account IDs                                 |
-| `regions`                      | Regions to check in every account                              |
-| `assumeRole`                   | IAM role name to assume via STS                                |
-| `awsProfile`                   | AWS CLI profile name (e.g. SSO profile for management account) |
-| `concurrency.maxWorkers`       | Max concurrent account×region operations                       |
-| `concurrency.retryMaxAttempts` | SDK retry ceiling for throttled/transient errors               |
-| `concurrency.retryMaxBackoff`  | Max backoff between retries (Go duration, e.g. `30s`)          |
+| Field | Description |
+|---|---|
+| `accounts` | List of target AWS account IDs |
+| `regions` | Regions to check in every account |
+| `assumeRole` | IAM role name to assume via STS |
+| `awsProfile` | AWS CLI profile name (e.g. SSO profile for management account) |
+| `concurrency.maxWorkers` | Max concurrent account×region operations |
+| `concurrency.retryMaxAttempts` | SDK retry ceiling for throttled/transient errors |
+| `concurrency.retryMaxBackoff` | Max backoff between retries (Go duration, e.g. `30s`) |
 
 ## Usage
 
@@ -73,16 +73,16 @@ Stops all active Config recorders. Does **not** delete recorders or delivery cha
 
 ### Flags
 
-| Flag            | Short | Default       | Description                                     |
-| --------------- | ----- | ------------- | ----------------------------------------------- |
-| `--config`      | `-c`  | `config.yaml` | Path to YAML config                             |
-| `--dry-run`     | `-d`  | `false`       | Check only, no changes                          |
-| `--output`      | `-o`  | `report.json` | Path for JSON report                            |
-| `--aws-profile` | `-p`  |               | AWS CLI profile (overrides config `awsProfile`) |
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--config` | `-c` | `config.yaml` | Path to YAML config |
+| `--dry-run` | `-d` | `false` | Check only, no changes |
+| `--output` | `-o` | `report.json` | Path for JSON report |
+| `--aws-profile` | `-p` | | AWS CLI profile (overrides config `awsProfile`) |
 
 ## Output
 
-The JSON report contains:
+The JSON report enumerates both customer-managed and service-linked recorders per region:
 
 ```json
 {
@@ -91,9 +91,11 @@ The JSON report contains:
   "summary": {
     "totalAccounts": 3,
     "totalRegions": 10,
-    "recordersEnabled": 28,
-    "recordersDisabled": 2,
-    "recordersAbsent": 0,
+    "customerRecordersEnabled": 28,
+    "customerRecordersDisabled": 2,
+    "customerRecordersAbsent": 0,
+    "serviceLinkedRecorders": 5,
+    "serviceLinkedRecordersPaid": 1,
     "errors": 0
   },
   "accounts": [
@@ -103,10 +105,20 @@ The JSON report contains:
       "regions": [
         {
           "region": "us-east-1",
-          "recorderName": "default",
-          "wasEnabled": true,
-          "currentStatus": "enabled",
-          "error": null
+          "customerRecorder": {
+            "name": "default",
+            "wasEnabled": true,
+            "currentStatus": "enabled"
+          },
+          "serviceLinkedRecorders": [
+            {
+              "name": "AWSConfigurationRecorderForCloudWatch",
+              "wasEnabled": true,
+              "currentStatus": "enabled",
+              "recordingScope": "INTERNAL",
+              "servicePrincipal": "cloudwatch.amazonaws.com"
+            }
+          ]
         }
       ]
     }
@@ -114,9 +126,17 @@ The JSON report contains:
 }
 ```
 
-- `wasEnabled`: recorder state **before** the run
-- `currentStatus`: recorder state **after** the run (`enabled`, `disabled`, `stopped`, `absent`, `error`)
-- `isManagementAccount`: flagged accounts where SCPs do **not** apply
+**Customer-managed recorder** (`customerRecorder`):
+- `null` if no customer-managed recorder exists in that region
+- `wasEnabled` / `currentStatus` track the before/after state
+- Only customer-managed recorders are stopped during live runs
+
+**Service-linked recorders** (`serviceLinkedRecorders`):
+- Created by AWS services (Security Hub, CloudWatch, etc.) — identified by the `AWSConfigurationRecorderFor` name prefix
+- `servicePrincipal` shows which AWS service owns the recorder
+- `recordingScope`: `INTERNAL` = free, no CIs in delivery channel; `PAID` = generates billable CIs
+- **Cannot be stopped via the Config API** — must be disabled through the owning AWS service
+- The tool reports them for visibility but never attempts to stop them
 
 ## Notes
 
@@ -125,10 +145,42 @@ The JSON report contains:
 - The SDK's built-in exponential backoff with jitter handles rate limiting. The `retryMaxAttempts` and `retryMaxBackoff` settings control the ceiling.
 - Only `StopConfigurationRecorder` is called. Recorders, delivery channels, and recorded data are preserved.
 
-## SCP — Prevent Config Re-enablement
+## SCPs — Prevent Config Re-enablement
 
-Before running the tool, attach `scp-deny-config-recorder.json` to your target OUs to prevent Config from being turned back on (by Control Tower drift remediation or anything else).
+Two SCPs are included. Apply them to your target OUs **before** running the tool.
 
-The included SCP denies `StartConfigurationRecorder`, `PutConfigurationRecorder`, and `PutDeliveryChannel` for all principals except a break-glass role. Edit the `BreakGlassRole` ARN to match your environment, or remove the condition block entirely for an absolute deny.
+### `scp-deny-config-customer-recorder.json` (deploy this)
 
-**Reminder:** SCPs do not apply to the management account. The management account must be monitored separately (see the `isManagementAccount` flag in reports).
+Blocks re-enablement of customer-managed recorders. Denies:
+
+- `config:StartConfigurationRecorder`
+- `config:PutConfigurationRecorder`
+- `config:PutDeliveryChannel`
+- `config:DeleteConfigurationRecorder` (prevents delete-and-recreate workaround)
+
+This is the primary SCP. It blocks Control Tower's `AWSControlTowerBP-BASELINE-CONFIG` StackSet, Firewall Manager's prerequisite StackSet, and any manual re-enablement. A break-glass role is exempted — edit the ARN to match your environment, or remove the condition for an absolute deny.
+
+### `scp-deny-config-service-linked-recorder.json` (deploy with caution)
+
+Blocks creation of service-linked recorders. Denies:
+
+- `config:PutServiceLinkedConfigurationRecorder`
+
+**Warning:** This will break AWS services that create service-linked recorders (CloudWatch telemetry audit, Security Hub features, etc.). Only deploy this if you've confirmed no services in your org depend on service-linked recorders, or if the cost savings justify the feature loss. Service-linked recorders with `INTERNAL` recording scope are free — run a dry-run first and check the `serviceLinkedRecordersPaid` count in the report before deciding.
+
+### Reminders
+
+- **SCPs do not apply to the management account.** Handle it separately.
+- **Control Tower will flag drift** when its StackSet operations fail against the SCP. This is expected noise — CT can't fix it, but it will complain.
+- **Firewall Manager requires Config** for compliance monitoring. If you're using FMS, check for its prerequisite StackSet (`aws-fms-*`) in the management account and either delete it or set `EnableConfig=No`.
+
+### Sources of Config re-enablement to audit
+
+| Source | Mechanism | Blocked by SCP? |
+|---|---|---|
+| Control Tower baseline | `AWSControlTowerBP-BASELINE-CONFIG` StackSet | Yes (customer SCP) |
+| Firewall Manager prereq | `aws-fms-prereq` StackSet with `EnableConfig=Yes` | Yes (customer SCP) |
+| Security Hub | Creates service-linked Config rules (not recorders) | N/A |
+| CloudWatch telemetry | Service-linked recorder (`INTERNAL` scope, free) | Only with service-linked SCP |
+| Manual re-enablement | Console or API call | Yes (customer SCP) |
+| Systems Manager Quick Setup | Can deploy Config recorders via StackSets | Yes (customer SCP) |
