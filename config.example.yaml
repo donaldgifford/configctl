@@ -1,0 +1,37 @@
+# configctl configuration
+#
+# accounts: list of AWS account IDs to target
+# regions:  list of AWS regions to check in each account
+# assumeRole: IAM role name to assume via STS in each target account
+# concurrency: controls parallelism and retry behavior
+
+accounts:
+  - "111111111111"
+  - "222222222222"
+  - "333333333333"
+
+regions:
+  - us-east-1
+  - us-east-2
+  - us-west-1
+  - us-west-2
+  - eu-west-1
+  - eu-west-2
+  - eu-central-1
+  - ap-southeast-1
+  - ap-southeast-2
+  - ap-northeast-1
+
+assumeRole: AWSControlTowerExecution
+
+# AWS CLI SSO profile for the management account.
+# Can be overridden with --aws-profile flag.
+awsProfile: mgmt-prod
+
+concurrency:
+  # Number of concurrent account×region operations.
+  maxWorkers: 10
+  # Maximum number of SDK retry attempts on throttling/transient errors.
+  retryMaxAttempts: 5
+  # Maximum backoff duration between retries (exponential with jitter).
+  retryMaxBackoff: 30s
